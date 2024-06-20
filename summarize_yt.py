@@ -53,7 +53,6 @@ def get_youtube_video_id(url: str) -> str | None:
             return parsed_url.path.split("/")[2]
         if parsed_url.path.startswith("/v/"):
             return parsed_url.path.split("/")[2]
-    return None
 
 
 @app.function(image=youtube_transcript_api_image)
@@ -67,7 +66,6 @@ def get_youtube_video_captions(video_id: str) -> str | None:
             return " ".join(line["text"] for line in captions)
     except Exception as e:
         logging.error(f"Error getting captions for video: {e}")
-        return None
 
 
 @app.function(image=pytube_image)
@@ -156,7 +154,7 @@ def summarize(chunk: str, model: str = "gpt-4o") -> str:
 @app.function(image=sqlmodel_image, volumes={"/youtube_data": volume})
 def run(
     url: str, model: str = "gpt-4o", load_from_db: bool = True, save_to_db: bool = True
-):
+) -> str:
     """Summarize a YouTube video and save the summary to a database."""
     from datetime import datetime
     from sqlmodel import Field, SQLModel, create_engine, Session, select
@@ -185,7 +183,6 @@ def run(
             video = session.exec(statement).first()
             if video:
                 return video
-        return None
 
     def save_video(engine, video: Video):
         """Save the video summary to the database."""
@@ -227,7 +224,7 @@ def run(
         save_video(engine, video)
         logging.info("Saved summary to db.")
 
-    return video.dict()
+    return video.summary
 
 
 ################################################################################
@@ -235,12 +232,14 @@ def run(
 ################################################################################
 
 
+# modal run summarize_yt::test_get_youtube_video_info --url https://www.youtube.com/watch\?v\=QIsLZTXHFYY
 @app.local_entrypoint()
 def test_get_youtube_video_info(url: str):
     video_id = get_youtube_video_id(url)
     print(get_youtube_video_info.remote(video_id))
 
 
+# modal run summarize_yt::test_summarize_yt --url https://www.youtube.com/watch\?v\=QIsLZTXHFYY
 @app.local_entrypoint()
 def test_summarize_yt(url: str):
     video = run.remote(url)
