@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO)
 
 app = App("summarize-youtube")
 
-volume = Volume.from_name("youtube-data")
+volume = Volume.from_name("youtube-data", create_if_missing=True)
 
 youtube_transcript_api_image = Image.debian_slim(python_version="3.12").run_commands(
     "pip install youtube_transcript_api"
@@ -23,8 +23,8 @@ nlp_image = Image.debian_slim(python_version="3.12").run_commands(
     "python -m spacy download en_core_web_lg",
 )
 
-openai_image = Image.debian_slim(python_version="3.12").run_commands(
-    "pip install openai"
+ai_image = Image.debian_slim(python_version="3.12").run_commands(
+    "pip install openai instructor"
 )
 
 tiktoken_image = Image.debian_slim(python_version="3.12").run_commands(
@@ -53,6 +53,7 @@ def get_youtube_video_id(url: str) -> str | None:
             return parsed_url.path.split("/")[2]
         if parsed_url.path.startswith("/v/"):
             return parsed_url.path.split("/")[2]
+    return None
 
 
 @app.function(image=youtube_transcript_api_image)
@@ -66,6 +67,7 @@ def get_youtube_video_captions(video_id: str) -> str | None:
             return " ".join(line["text"] for line in captions)
     except Exception as e:
         logging.error(f"Error getting captions for video: {e}")
+    return None
 
 
 @app.function(image=pytube_image)
@@ -100,13 +102,10 @@ def get_token_counts(
     import tiktoken
 
     encoding = tiktoken.get_encoding(encoding_name)
-
-    token_counts = [len(encoding.encode(text)) for text in input_list]
-
-    return token_counts
+    return [len(encoding.encode(text)) for text in input_list]
 
 
-def create_chunks(text_segments: list[str], max_tokens: int = 4095 * 0.9) -> list[str]:
+def create_chunks(text_segments: list[str], max_tokens: int = 4095 * 0.8) -> list[str]:
     """
     Combines text_segments into larger chunks without exceeding a specified token count.
     """
@@ -129,26 +128,32 @@ def create_chunks(text_segments: list[str], max_tokens: int = 4095 * 0.9) -> lis
     return output_chunks
 
 
-@app.function(image=openai_image, secrets=[Secret.from_name("openai")])
-def summarize(chunk: str, model: str = "gpt-4o") -> str:
+@app.function(image=ai_image, secrets=[Secret.from_name("openai")])
+def summarize(chunk: str, model: str = "gpt-4o") -> list[dict]:
     """Summarize a chunk of text using OpenAI."""
+    import instructor
+    from pydantic import BaseModel
     from openai import OpenAI
+
+    class Section(BaseModel):
+        title: str
+        text: str
 
     messages = [
         {
             "role": "system",
-            "content": "Summarize the main ideas and key points in the style of Paul Graham's essays. Focus solely on the ideas, not the speakers. Ensure the text is concise, memorable, and engaging. Use markdown formatting. Avoid prepositional phrases. Exclude advertisements. Note that the content might be part of a longer video so do not rush to conclusion.",
+            "content": "Summarize the main ideas and key points in the style of Paul Graham's essays from the following captions snippet. Focus solely on the ideas and lessons, not on the speakers or individuals. Ensure the text is concise, memorable, and engaging. Avoid prepositional phrases. If encounter product placement or other advertisement, exclude them. Each key idea should be broken down into a seperate section with its own title and description. Each section should be relatively short, under 300 words. Note that the provided captions might be part of a longer video so do not rush to conclusion. The reader's time is extremely valuable, if some section doesn't have high-quality content, exclude them. The final output must have very high signal:noise.",
         },
         {"role": "user", "content": chunk},
     ]
-
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    response = client.chat.completions.create(
+    client = instructor.from_openai(OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
+    sections = client.chat.completions.create(
         model=model,
+        response_model=list[Section],
         messages=messages,
         temperature=0.2,
     )
-    return response.choices[0].message.content
+    return [section.dict() for section in sections]
 
 
 @app.function(image=sqlmodel_image, volumes={"/youtube_data": volume})
@@ -158,6 +163,7 @@ def run(
     """Summarize a YouTube video and save the summary to a database."""
     from datetime import datetime
     from sqlmodel import Field, SQLModel, create_engine, Session, select
+    from itertools import chain
 
     class Video(SQLModel, table=True):
         video_id: str = Field(primary_key=True)
@@ -166,7 +172,7 @@ def run(
         length: int
         thumbnail_url: str
         publish_date: datetime
-        caption: str
+        captions: str
         summary: str
         created_at: datetime = Field(default_factory=datetime.now)
 
@@ -192,30 +198,35 @@ def run(
 
     video_id = get_youtube_video_id(url)
     if not video_id:
-        raise ValueError(f"No video ID found for URL: {url}")
+        return "Invalid YouTube URL."
 
     engine = initialize_database()
+
     if load_from_db:
         video = get_video(engine, video_id)
         if video:
-            existing_summary = video.summary
             logging.info("Loaded summary from db.")
-            return existing_summary
+            return video.summary
 
-    caption = get_youtube_video_captions.remote(video_id)
-    logging.info("Loaded caption from YouTube.")
-    sentences = get_sentences.remote(caption)
+    captions = get_youtube_video_captions.remote(video_id)
+    if not captions:
+        return "No captions available for this video."
+    logging.info("Loaded captions from YouTube.")
+
+    sentences = get_sentences.remote(captions)
     logging.info(f"{len(sentences)} sentence(s) found.")
     chunks = create_chunks(sentences)
     logging.info(f"Summarizing {len(chunks)} chunk(s).")
-    summaries = list(summarize.map(chunks))
-    final_summary = "\n\n".join(summaries)
+    summaries = list(chain.from_iterable(summarize.map(chunks)))
+    summary_text = "\n\n".join(
+        f"## {section['title']}\n{section['text']}" for section in summaries
+    )
 
     video = Video(
         video_id=video_id,
-        caption=caption,
-        summary=final_summary,
-        chunks=chunks,
+        captions=captions,  # raw_captions
+        summary=summary_text,
+        chunks=chunks,  # chunk embeddings? For Q&A
         chunk_summaries=summaries,
         **get_youtube_video_info.remote(video_id),
     )
@@ -224,7 +235,7 @@ def run(
         save_video(engine, video)
         logging.info("Saved summary to db.")
 
-    return video.summary
+    return summary_text
 
 
 ################################################################################
@@ -237,6 +248,12 @@ def run(
 def test_get_youtube_video_info(url: str):
     video_id = get_youtube_video_id(url)
     print(get_youtube_video_info.remote(video_id))
+
+
+# modal run summarize_yt::test_summarize_chunk --chunk "This is a really long piece of test chunk."
+@app.local_entrypoint()
+def test_summarize_chunk(chunk: str):
+    print(summarize.remote(chunk))
 
 
 # modal run summarize_yt::test_summarize_yt --url https://www.youtube.com/watch\?v\=QIsLZTXHFYY
