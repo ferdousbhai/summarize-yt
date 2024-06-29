@@ -1,14 +1,12 @@
 import os
 
-from modal import App, Image, Secret, Volume
+from modal import App, Image, Secret
 
 import logging
 
 logging.basicConfig(level=logging.INFO)
 
 app = App("summarize-youtube")
-
-volume = Volume.from_name("youtube-data", create_if_missing=True)
 
 youtube_transcript_api_image = Image.debian_slim(python_version="3.12").run_commands(
     "pip install youtube_transcript_api"
@@ -31,8 +29,8 @@ tiktoken_image = Image.debian_slim(python_version="3.12").run_commands(
     "pip install tiktoken"
 )
 
-sqlmodel_image = Image.debian_slim(python_version="3.12").run_commands(
-    "pip install sqlmodel"
+db_image = Image.debian_slim(python_version="3.12").run_commands(
+    "pip install sqlmodel psycopg2-binary"
 )
 
 
@@ -75,14 +73,19 @@ def get_youtube_video_info(video_id: str) -> dict:
     """Get the video info from a YouTube video."""
     from pytube import YouTube
 
-    yt = YouTube(f"https://youtu.be/{video_id}")
-    return {
-        "title": yt.title,
-        "author": yt.author,
-        "length": yt.length,
-        "thumbnail_url": yt.thumbnail_url,
-        "publish_date": yt.publish_date,
-    }
+    try:
+        yt = YouTube(f"https://youtu.be/{video_id}")
+        video_info = {
+            "title": yt.title,
+            "author": yt.author,
+            "length": yt.length,
+            "thumbnail_url": yt.thumbnail_url,
+            "publish_date": yt.publish_date,
+        }
+        return video_info
+    except Exception as e:
+        logging.error(f"Error getting video info for video: {e}")
+        return {}
 
 
 @app.function(image=nlp_image)
@@ -105,7 +108,7 @@ def get_token_counts(
     return [len(encoding.encode(text)) for text in input_list]
 
 
-def create_chunks(text_segments: list[str], max_tokens: int = 4095 * 0.8) -> list[str]:
+def create_chunks(text_segments: list[str], max_tokens: int = 4095 * 0.85) -> list[str]:
     """
     Combines text_segments into larger chunks without exceeding a specified token count.
     """
@@ -142,7 +145,7 @@ def summarize(chunk: str, model: str = "gpt-4o") -> list[dict]:
     messages = [
         {
             "role": "system",
-            "content": "Summarize the main ideas and key points in the style of Paul Graham's essays from the following captions snippet. Focus solely on the ideas and lessons, not on the speakers or individuals. Ensure the text is concise, memorable, and engaging. Avoid prepositional phrases. If encounter product placement or other advertisement, exclude them. Each key idea should be broken down into a seperate section with its own title and description. Each section should be relatively short, under 300 words. Note that the provided captions might be part of a longer video so do not rush to conclusion. The reader's time is extremely valuable, if some section doesn't have high-quality content, exclude them. The final output must have very high signal:noise.",
+            "content": "Summarize the main ideas and key points of the following captions snippet. Ensure the text is concise, memorable, and engaging. Avoid prepositional phrases. If encounter product placement or other advertisement, exclude them. Each key idea should be broken down into a seperate section with its own title and description. Each section should be relatively short, under 300 words. Note that the provided captions might be part of a longer video so do not rush to conclusion. The reader's time is extremely valuable, so if some section doesn't have high-quality content, exclude them. The final output must have very high signal:noise.",
         },
         {"role": "user", "content": chunk},
     ]
@@ -156,14 +159,22 @@ def summarize(chunk: str, model: str = "gpt-4o") -> list[dict]:
     return [section.dict() for section in sections]
 
 
-@app.function(image=sqlmodel_image, volumes={"/youtube_data": volume})
+@app.function(image=db_image, secrets=[Secret.from_name("video-data")])
 def run(
     url: str, model: str = "gpt-4o", load_from_db: bool = True, save_to_db: bool = True
 ) -> str:
     """Summarize a YouTube video and save the summary to a database."""
     from datetime import datetime
     from sqlmodel import Field, SQLModel, create_engine, Session, select
+    from sqlalchemy.exc import SQLAlchemyError
+    from uuid import uuid4
     from itertools import chain
+
+    class Summary(SQLModel, table=True):
+        id: str = Field(default_factory=lambda: str(uuid4()), primary_key=True)
+        video_id: str = Field(foreign_key="video.video_id")
+        content: str
+        author: str
 
     class Video(SQLModel, table=True):
         video_id: str = Field(primary_key=True)
@@ -172,29 +183,56 @@ def run(
         length: int
         thumbnail_url: str
         publish_date: datetime
-        captions: str
-        summary: str
+        caption_sentences: str
         created_at: datetime = Field(default_factory=datetime.now)
 
     def initialize_database():
         """Initialize the database and create tables if they don't exist."""
-        engine = create_engine("sqlite:////youtube_data/youtube.db")
+        engine = create_engine(os.environ["DATABASE_URL_DEV"])
         SQLModel.metadata.create_all(engine)
         return engine
 
-    def get_video(engine, video_id: str) -> Video | None:
-        """Check if the video already exists in the database."""
-        with Session(engine) as session:
-            statement = select(Video).where(Video.video_id == video_id)
-            video = session.exec(statement).first()
-            if video:
-                return video
+    def save_to_db(
+        engine, video_id: str, sentences: list[str], summary_content: str, model: str
+    ):
+        """Save the video and summary to the database."""
+        try:
+            with Session(engine) as session:
+                video_info = get_youtube_video_info.remote(video_id)
+                video = Video(
+                    video_id=video_id,
+                    **video_info,
+                    caption_sentences="\n".join(sentences),
+                )
+                summary = Summary(
+                    video_id=video_id, content=summary_content, author=model
+                )
 
-    def save_video(engine, video: Video):
-        """Save the video summary to the database."""
-        with Session(engine) as session:
-            session.add(video)
-            session.commit()
+                session.add(video)
+                session.add(summary)
+                session.commit()
+                logging.info("Saved video and summary to db.")
+        except SQLAlchemyError as e:
+            logging.error(f"Error saving to the database: {e}")
+            session.rollback()
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}")
+
+    def get_summary(engine, video_id: str) -> list[Summary] | None:
+        """Check if the summary already exists in the database."""
+        try:
+            with Session(engine) as session:
+                statement = select(Summary).where(Summary.video_id == video_id)
+                summaries = session.exec(statement).all()
+                if summaries:
+                    logging.info("Loaded summary from db.")
+                    return summaries
+        except SQLAlchemyError as e:
+            logging.error(f"Error getting summary from the database: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}")
+            return None
 
     video_id = get_youtube_video_id(url)
     if not video_id:
@@ -203,10 +241,9 @@ def run(
     engine = initialize_database()
 
     if load_from_db:
-        video = get_video(engine, video_id)
-        if video:
-            logging.info("Loaded summary from db.")
-            return video.summary
+        summaries = get_summary(engine, video_id)
+        if summaries:
+            return summaries[0].content
 
     captions = get_youtube_video_captions.remote(video_id)
     if not captions:
@@ -217,25 +254,14 @@ def run(
     logging.info(f"{len(sentences)} sentence(s) found.")
     chunks = create_chunks(sentences)
     logging.info(f"Summarizing {len(chunks)} chunk(s).")
-    summaries = list(chain.from_iterable(summarize.map(chunks)))
-    summary_text = "\n\n".join(
-        f"## {section['title']}\n{section['text']}" for section in summaries
-    )
-
-    video = Video(
-        video_id=video_id,
-        captions=captions,  # raw_captions
-        summary=summary_text,
-        chunks=chunks,  # chunk embeddings? For Q&A
-        chunk_summaries=summaries,
-        **get_youtube_video_info.remote(video_id),
+    chunk_summaries = list(chain.from_iterable(summarize.map(chunks)))
+    combined_summary_text = "\n\n".join(
+        f"## {section['title']}\n{section['text']}" for section in chunk_summaries
     )
 
     if save_to_db:
-        save_video(engine, video)
-        logging.info("Saved summary to db.")
-
-    return summary_text
+        save_to_db(engine, video_id, sentences, combined_summary_text, model)
+    return combined_summary_text
 
 
 ################################################################################
@@ -243,20 +269,20 @@ def run(
 ################################################################################
 
 
-# modal run summarize_yt::test_get_youtube_video_info --url https://www.youtube.com/watch\?v\=QIsLZTXHFYY
+# modal run summarize_yt::test_get_youtube_video_info --url ...
 @app.local_entrypoint()
 def test_get_youtube_video_info(url: str):
     video_id = get_youtube_video_id(url)
     print(get_youtube_video_info.remote(video_id))
 
 
-# modal run summarize_yt::test_summarize_chunk --chunk "This is a really long piece of test chunk."
+# modal run summarize_yt::test_summarize_chunk --chunk "..."
 @app.local_entrypoint()
 def test_summarize_chunk(chunk: str):
     print(summarize.remote(chunk))
 
 
-# modal run summarize_yt::test_summarize_yt --url https://www.youtube.com/watch\?v\=QIsLZTXHFYY
+# modal run summarize_yt::test_summarize_yt --url ...
 @app.local_entrypoint()
 def test_summarize_yt(url: str):
     video = run.remote(url)
