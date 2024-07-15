@@ -108,7 +108,7 @@ def get_token_counts(
     return [len(encoding.encode(text)) for text in input_list]
 
 
-def create_chunks(text_segments: list[str], max_tokens: int = 4095 * 0.85) -> list[str]:
+def create_chunks(text_segments: list[str], max_tokens: int = 4095 * 0.95) -> list[str]:
     """
     Combines text_segments into larger chunks without exceeding a specified token count.
     """
@@ -132,7 +132,9 @@ def create_chunks(text_segments: list[str], max_tokens: int = 4095 * 0.85) -> li
 
 
 @app.function(image=ai_image, secrets=[Secret.from_name("openai")])
-def summarize(chunk: str, model: str = "gpt-4o") -> list[dict]:
+def summarize(
+    chunk: str, model: str = "gpt-4o", temperature: float = 0.8
+) -> list[dict]:
     """Summarize a chunk of text using OpenAI."""
     import instructor
     from pydantic import BaseModel
@@ -154,7 +156,7 @@ def summarize(chunk: str, model: str = "gpt-4o") -> list[dict]:
         model=model,
         response_model=list[Section],
         messages=messages,
-        temperature=0.2,
+        temperature=temperature,
     )
     return [section.dict() for section in sections]
 
@@ -218,7 +220,7 @@ def run(
         except Exception as e:
             logging.error(f"Unexpected error: {e}")
 
-    def get_summary(engine, video_id: str) -> list[Summary] | None:
+    def get_summaries(engine, video_id: str) -> list[Summary] | None:
         """Check if the summary already exists in the database."""
         try:
             with Session(engine) as session:
@@ -241,9 +243,9 @@ def run(
     engine = initialize_database()
 
     if load_from_db:
-        summaries = get_summary(engine, video_id)
+        summaries = get_summaries(engine, video_id)
         if summaries:
-            return summaries[0].content
+            return summaries[0].content  # v1 of the app supports only one summary
 
     captions = get_youtube_video_captions.remote(video_id)
     if not captions:
@@ -255,13 +257,13 @@ def run(
     chunks = create_chunks(sentences)
     logging.info(f"Summarizing {len(chunks)} chunk(s).")
     chunk_summaries = list(chain.from_iterable(summarize.map(chunks)))
-    combined_summary_text = "\n\n".join(
+    combined_summary_md = "\n\n".join(
         f"## {section['title']}\n{section['text']}" for section in chunk_summaries
     )
 
     if save_to_db:
-        save_to_db(engine, video_id, sentences, combined_summary_text, model)
-    return combined_summary_text
+        save_to_db(engine, video_id, sentences, combined_summary_md, model)
+    return combined_summary_md
 
 
 ################################################################################
